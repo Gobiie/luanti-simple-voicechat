@@ -9,7 +9,7 @@
 	},
 	"scripts": {
 		"start": "node src/server.js",
-		"test": "node --test test/"
+		"test": "node --test test/*.test.js"
 	},
 	"dependencies": {
 		"ws": "^8.18.0"
