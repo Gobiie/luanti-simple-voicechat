@@ -1033,10 +1033,10 @@ index 0000000..9e1b46a
 +#endif // USE_SOUND
 diff --git a/src/client/voicechat.h b/src/client/voicechat.h
 new file mode 100644
-index 0000000..0f810d0
+index 0000000..af2919f
 --- /dev/null
 +++ b/src/client/voicechat.h
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,125 @@
 +// Luanti
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +//
@@ -1114,6 +1114,7 @@ index 0000000..0f810d0
 +	bool parseControl(const std::string &message, std::string &token,
 +			std::string &host, uint16_t &port);
 +
++	std::thread m_thread;
 +	std::atomic<bool> m_thread_stop{false};
 +	std::atomic<bool> m_connected{false};
 +	std::atomic<bool> m_transmitting{false};
