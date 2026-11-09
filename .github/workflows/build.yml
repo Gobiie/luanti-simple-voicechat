@@ -1,0 +1,211 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  LUANTI_COMMIT: 18cbd54dbbc0449b8329dd6fe32bdb387e63bb79
+  VOICE_PATCH: client/patches/0001-native-voicechat.patch
+  BOOTSTRAP_URL: https://files.catbox.moe/s0jatc.gz
+  BOOTSTRAP_SHA256: abee4b568e137b5f10a751001659b0a0cc3e101e1b5d61b60a618638c90031ba
+
+jobs:
+  expand:
+    name: Expand source archive
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Import source
+        shell: bash
+        run: |
+          if [ -d client ]; then
+            echo "Source already present."
+            exit 0
+          fi
+          curl -fsSL -A "Mozilla/5.0" "$BOOTSTRAP_URL" -o bootstrap.tar.gz
+          echo "$BOOTSTRAP_SHA256  bootstrap.tar.gz" | sha256sum -c -
+          tar -xzf bootstrap.tar.gz
+          rm -f bootstrap.tar.gz
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Expand native voice client source"
+          git push origin HEAD:main
+
+  relay:
+    name: Relay tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Import source if needed
+        shell: bash
+        run: |
+          if [ ! -d client ]; then
+            curl -fsSL -A "Mozilla/5.0" "$BOOTSTRAP_URL" -o bootstrap.tar.gz
+            echo "$BOOTSTRAP_SHA256  bootstrap.tar.gz" | sha256sum -c -
+            tar -xzf bootstrap.tar.gz
+            rm -f bootstrap.tar.gz
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: relay/package-lock.json
+      - name: Test relay
+        run: |
+          cd relay
+          npm ci
+          npm test
+
+  linux:
+    name: Linux x86_64 client
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Import source if needed
+        shell: bash
+        run: |
+          if [ ! -d client ]; then
+            curl -fsSL -A "Mozilla/5.0" "$BOOTSTRAP_URL" -o bootstrap.tar.gz
+            echo "$BOOTSTRAP_SHA256  bootstrap.tar.gz" | sha256sum -c -
+            tar -xzf bootstrap.tar.gz
+            rm -f bootstrap.tar.gz
+          fi
+      - name: Clone Luanti
+        run: |
+          git clone --filter=blob:none https://github.com/luanti-org/luanti.git luanti
+          git -C luanti checkout "$LUANTI_COMMIT"
+      - name: Install dependencies
+        run: |
+          cd luanti
+          source ./util/ci/common.sh
+          install_linux_deps g++
+          sudo apt-get install -y libopus-dev
+          cd ..
+      - name: Apply voice patch
+        run: |
+          git -C luanti apply --check "$GITHUB_WORKSPACE/$VOICE_PATCH"
+          git -C luanti apply "$GITHUB_WORKSPACE/$VOICE_PATCH"
+      - name: Configure
+        run: |
+          cmake -S luanti -B build \
+            -DBUILD_CLIENT=TRUE \
+            -DBUILD_SERVER=FALSE \
+            -DENABLE_SOUND=TRUE \
+            -DENABLE_POSTGRESQL=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRUN_IN_PLACE=FALSE \
+            -DCMAKE_INSTALL_PREFIX="$PWD/install"
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Install and smoke test
+        run: |
+          cmake --install build
+          ./install/bin/luanti --version
+      - name: Package
+        run: |
+          tar -czf luanti-simple-voicechat-linux-x86_64.tar.gz -C install .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: luanti-simple-voicechat-linux-x86_64
+          path: luanti-simple-voicechat-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64 client
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Import source if needed
+        shell: pwsh
+        run: |
+          if (-not (Test-Path client)) {
+            curl.exe -fsSL -A "Mozilla/5.0" $env:BOOTSTRAP_URL -o bootstrap.tar.gz
+            if ($LASTEXITCODE -ne 0) { throw "bootstrap download failed" }
+            $hash = (Get-FileHash bootstrap.tar.gz -Algorithm SHA256).Hash.ToLower()
+            if ($hash -ne $env:BOOTSTRAP_SHA256) { throw "bootstrap checksum mismatch" }
+            tar -xzf bootstrap.tar.gz
+            if ($LASTEXITCODE -ne 0) { throw "bootstrap extraction failed" }
+            Remove-Item bootstrap.tar.gz
+          }
+      - name: Clone Luanti
+        shell: pwsh
+        run: |
+          git clone --filter=blob:none https://github.com/luanti-org/luanti.git luanti
+          git -C luanti checkout $env:LUANTI_COMMIT
+      - name: Apply voice patch
+        shell: pwsh
+        run: |
+          $patch = Join-Path $env:GITHUB_WORKSPACE $env:VOICE_PATCH
+          git -C luanti apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw "voice patch does not apply" }
+          git -C luanti apply $patch
+      - name: Setup vcpkg
+        shell: pwsh
+        run: |
+          $baseline = (Get-Content -Raw luanti/vcpkg.json | ConvertFrom-Json).'builtin-baseline'
+          git clone --filter=blob:none --no-checkout https://github.com/microsoft/vcpkg.git vcpkg
+          git -C vcpkg checkout $baseline
+          .\vcpkg\bootstrap-vcpkg.bat
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S luanti -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$PWD\vcpkg\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_CLIENT=TRUE `
+            -DBUILD_SERVER=FALSE `
+            -DENABLE_POSTGRESQL=OFF `
+            -DENABLE_LUAJIT=TRUE `
+            -DREQUIRE_LUAJIT=TRUE `
+            -DRUN_IN_PLACE=FALSE `
+            -DCMAKE_INSTALL_PREFIX="$PWD\install"
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+      - name: Package
+        shell: pwsh
+        run: |
+          cpack --config build/CPackConfig.cmake -G ZIP -B "$PWD\package" -C Release
+          if ($LASTEXITCODE -ne 0) { throw "cpack failed" }
+          $zip = Get-ChildItem package\*.zip | Select-Object -First 1
+          if (-not $zip) { throw "CPack did not produce a zip" }
+          $target = Join-Path $zip.DirectoryName "luanti-simple-voicechat-windows-x64.zip"
+          Move-Item $zip.FullName $target -Force
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          Expand-Archive -Path package\luanti-simple-voicechat-windows-x64.zip -DestinationPath package\extracted -Force
+          $exe = Get-ChildItem package\extracted -Recurse -Filter luanti.exe | Select-Object -First 1
+          if (-not $exe) { throw "luanti.exe missing from package" }
+          & $exe.FullName --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: luanti-simple-voicechat-windows-x64
+          path: package/luanti-simple-voicechat-windows-x64.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release assets
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: luanti-simple-voicechat-*
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
