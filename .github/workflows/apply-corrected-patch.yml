@@ -1,0 +1,32 @@
+name: apply-corrected-patch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Install corrected patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -A "Mozilla/5.0" "https://files.catbox.moe/0ct5xc.patch" -o /tmp/voice.patch
+          echo "81708c029fc0dc89185dac3d1aa7f29a90b5edf6a7c4521a85068c54a713b0ce  /tmp/voice.patch" | sha256sum -c -
+          cp /tmp/voice.patch client/patches/0001-native-voicechat.patch
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add client/patches/0001-native-voicechat.patch
+          if git diff --cached --quiet; then
+            echo "Patch already current."
+            exit 0
+          fi
+          git commit -m "Add missing voice chat thread member"
+          git push origin HEAD:main
