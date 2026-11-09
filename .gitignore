@@ -1,0 +1,11 @@
+node_modules/
+relay/config.json
+relay/certs/
+*.pem
+*.key
+recordings/
+
+client/work/
+client/luanti/
+client/build/
+client/verify/

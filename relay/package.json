@@ -1,0 +1,17 @@
+{
+	"name": "simple-voicechat-relay",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Control plane and WebRTC signaling server for Simple Voice Chat for Luanti",
+	"engines": {
+		"node": ">=20"
+	},
+	"scripts": {
+		"start": "node src/server.js",
+		"test": "node --test test/"
+	},
+	"dependencies": {
+		"ws": "^8.18.0"
+	}
+}

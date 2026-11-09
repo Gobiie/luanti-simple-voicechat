@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Simple Voice Chat - Luanti</title>
+		<link rel="stylesheet" href="/style.css" />
+	</head>
+	<body>
+		<div id="join" class="screen">
+			<form id="join-form" class="card join-card" autocomplete="off">
+				<h1>Simple Voice Chat <span class="badge">Luanti</span></h1>
+				<p class="lede">
+					Proximity voice, password groups, whispers and broadcast, routed by your Luanti server.
+				</p>
+
+				<label for="code">Join code</label>
+				<input
+					id="code"
+					name="code"
+					class="code-input"
+					maxlength="6"
+					placeholder="ABC123"
+					autocapitalize="characters"
+					spellcheck="false"
+				/>
+
+				<details id="link-details">
+					<summary>Use a link instead</summary>
+					<label for="link">Voice link</label>
+					<input id="link" name="link" placeholder="https://voice.example.com/?t=..." spellcheck="false" />
+				</details>
+
+				<button id="join-button" type="submit" class="primary">Join voice</button>
+				<p id="join-error" class="error" role="alert"></p>
+				<p class="hint">
+					In game, type <code>/voice</code> to get a code. Browsers only allow microphone access on
+					<code>localhost</code> or HTTPS.
+				</p>
+			</form>
+		</div>
+
+		<main id="app" hidden>
+			<header class="topbar">
+				<div class="identity">
+					<span id="conn-dot" class="dot"></span>
+					<div>
+						<strong id="me-name">-</strong>
+						<span id="me-state" class="sub">connecting</span>
+					</div>
+				</div>
+				<div class="top-actions">
+					<button id="mute-button" class="pill" title="Mute (M)">Mute</button>
+					<button id="whisper-button" class="pill" title="Hold to whisper">Whisper</button>
+					<button id="broadcast-button" class="pill" hidden title="Broadcast">Broadcast</button>
+					<button id="record-button" class="pill" hidden>Record</button>
+					<button id="leave-button" class="pill danger">Leave</button>
+				</div>
+			</header>
+
+			<section class="card mic-panel">
+				<div class="meter" aria-hidden="true">
+					<div id="meter-fill"></div>
+					<div id="meter-threshold"></div>
+				</div>
+				<div class="mic-meta">
+					<span id="mic-status">Microphone starting…</span>
+					<span id="mic-mode">Voice activation</span>
+					<span id="rtt" class="sub"></span>
+				</div>
+				<div class="row">
+					<button id="test-speaker">Test speaker</button>
+					<button id="monitor-button">Monitor mic</button>
+					<button id="settings-toggle">Settings</button>
+				</div>
+			</section>
+
+			<div class="columns">
+				<section class="card">
+					<h2>Voice players <span id="player-count" class="count">0</span></h2>
+					<ul id="roster" class="roster"></ul>
+					<p id="roster-empty" class="hint">Nobody else is in range or in your group.</p>
+				</section>
+
+				<section class="card">
+					<h2>Group</h2>
+					<div id="group-current" hidden>
+						<p>
+							<strong id="group-name"></strong>
+							<span id="group-type-label" class="tag"></span>
+							<span id="group-locked" class="tag" hidden>locked</span>
+						</p>
+						<p id="group-members" class="hint"></p>
+						<form id="group-invite-form" class="row">
+							<input id="group-invite-name" maxlength="64" placeholder="Invite player" spellcheck="false" />
+							<button type="submit">Invite</button>
+						</form>
+						<button id="group-leave">Leave group</button>
+					</div>
+					<form id="group-form">
+						<label for="group-input">Group name</label>
+						<input id="group-input" maxlength="24" placeholder="e.g. builders" spellcheck="false" />
+						<label for="group-password">Password (optional)</label>
+						<input id="group-password" type="password" maxlength="64" placeholder="optional" />
+						<label for="group-type">Group type</label>
+						<select id="group-type">
+							<option value="normal">Normal - hear nearby players</option>
+							<option value="open">Open - hear and be heard nearby</option>
+							<option value="isolated">Isolated - group only</option>
+						</select>
+						<button type="submit" class="primary">Join or create group</button>
+					</form>
+					<p class="hint">
+						Members hear each other at any distance. Normal groups also hear nearby players, open groups
+						are heard back, isolated groups hear nobody outside. Leaving returns you to proximity.
+					</p>
+				</section>
+			</div>
+
+			<section id="settings" class="card" hidden>
+				<h2>Settings</h2>
+				<div class="settings-grid">
+					<label>
+						Mode
+						<select id="mode-select">
+							<option value="vad">Voice activation</option>
+							<option value="ptt">Push to talk</option>
+						</select>
+					</label>
+					<label>
+						Microphone
+						<select id="input-device">
+							<option value="">System default microphone</option>
+						</select>
+					</label>
+					<label>
+						Speakers
+						<select id="output-device">
+							<option value="">System default speakers</option>
+						</select>
+					</label>
+					<label>
+						Activation threshold <output id="threshold-value"></output>
+						<input id="threshold" type="range" min="0.002" max="0.08" step="0.002" />
+					</label>
+					<label>
+						Microphone gain <output id="gain-value"></output>
+						<input id="input-gain" type="range" min="0.2" max="4" step="0.1" />
+					</label>
+					<label>
+						Master volume <output id="volume-value"></output>
+						<input id="master-volume" type="range" min="0" max="1.5" step="0.05" />
+					</label>
+					<label class="check"><input id="spatial" type="checkbox" /> 3D positional audio</label>
+					<label class="check"><input id="auto-gain" type="checkbox" /> Automatic microphone gain</label>
+					<label class="check"><input id="compact" type="checkbox" /> Hide extra interface</label>
+				</div>
+				<div class="keys">
+					<button class="keybind" data-action="pttKey">Push to talk <kbd></kbd></button>
+					<button class="keybind" data-action="whisperKey">Whisper <kbd></kbd></button>
+					<button class="keybind" data-action="broadcastKey">Broadcast <kbd></kbd></button>
+					<button class="keybind" data-action="muteKey">Mute <kbd></kbd></button>
+				</div>
+				<p class="hint">
+					Keys only fire while this tab has focus. Use voice activation if you play full screen.
+				</p>
+			</section>
+
+			<section id="recordings" class="card" hidden>
+				<h2>Recordings</h2>
+				<p class="hint">Incoming audio is recorded per player plus one mixed track.</p>
+				<ul id="recording-list"></ul>
+			</section>
+
+			<footer class="hint">
+				Ranges: <span id="range-info">-</span>. Audio is peer to peer and encrypted with DTLS-SRTP.
+			</footer>
+		</main>
+
+		<div id="toasts" class="toasts" aria-live="polite"></div>
+		<script src="/app.js" type="module"></script>
+	</body>
+</html>

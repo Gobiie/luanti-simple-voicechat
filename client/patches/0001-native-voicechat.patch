@@ -1,0 +1,1223 @@
+diff --git a/builtin/settingtypes.txt b/builtin/settingtypes.txt
+index 0e96ac0..cb6bc7f 100644
+--- a/builtin/settingtypes.txt
++++ b/builtin/settingtypes.txt
+@@ -2557,3 +2557,28 @@ show_technical_names (Show technical names) bool false
+ 
+ #    Controlled by a checkbox in the settings menu.
+ show_advanced (Show advanced settings) bool false
++
++[Voice Chat]
++#    Enable the native in-game voice client. Requires a client built with this patch.
++voicechat.enabled (Enable native voice chat) bool true
++
++#    Host name or IP address of the voice relay's UDP listener.
++voicechat.relay_host (Voice relay host) string 127.0.0.1
++
++#    UDP port of the voice relay. Must match simple_voicechat.voice_udp_port in the relay config.
++voicechat.relay_port (Voice relay UDP port) int 1 65535 8091
++
++#    Hold the push-to-talk key while speaking.
++voicechat.push_to_talk (Push to talk) bool true
++
++#    RMS threshold for open-microphone mode when push-to-talk is disabled.
++voicechat.voice_activation_threshold (Voice activation threshold) float 0.0 1.0 0.02
++
++#    Microphone input gain.
++voicechat.input_gain (Microphone gain) float 0.1 4.0 1.0
++
++#    Playback volume for other players.
++voicechat.output_volume (Voice output volume) float 0.0 1.0 1.0
++
++#    Key for push-to-talk. Default is F; V is already used by the minimap.
++keymap_voice (Voice push-to-talk) key SYSTEM_SCANCODE_9
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index d6ab292..e103455 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -126,8 +126,20 @@ if(BUILD_CLIENT AND ENABLE_SOUND)
+ 		mark_as_advanced(CLEAR OGG_INCLUDE_DIR VORBIS_INCLUDE_DIR OGG_LIBRARY VORBIS_LIBRARY VORBISFILE_LIBRARY)
+ 	endif()
+ 	if(OPENAL_FOUND AND VORBIS_FOUND)
++		# Opus is used by the native voice client. Prefer the normal CMake
++		# find_path/find_library route (works with vcpkg on Windows); fall back
++		# to pkg-config on systems where the headers are only exposed there.
++		find_path(OPUS_INCLUDE_DIR opus.h PATH_SUFFIXES opus)
++		find_library(OPUS_LIBRARY NAMES opus)
++		if(NOT OPUS_INCLUDE_DIR OR NOT OPUS_LIBRARY)
++			find_package(PkgConfig REQUIRED)
++			pkg_check_modules(OPUS REQUIRED opus)
++		else()
++			set(OPUS_INCLUDE_DIRS ${OPUS_INCLUDE_DIR})
++			set(OPUS_LIBRARIES ${OPUS_LIBRARY})
++		endif()
+ 		set(USE_SOUND TRUE)
+-		message(STATUS "Sound enabled.")
++		message(STATUS "Sound enabled (OpenAL, Vorbis, Opus).")
+ 	else()
+ 		message(FATAL_ERROR "Sound enabled, but cannot be used.\n"
+ 			"To continue, either fill in the required paths or disable sound. (-DENABLE_SOUND=0)")
+diff --git a/src/client/CMakeLists.txt b/src/client/CMakeLists.txt
+index 2f68883..e47f56b 100644
+--- a/src/client/CMakeLists.txt
++++ b/src/client/CMakeLists.txt
+@@ -16,10 +16,12 @@ if(USE_SOUND)
+ 		${OPENAL_INCLUDE_DIR}
+ 		${VORBIS_INCLUDE_DIR}
+ 		${OGG_INCLUDE_DIR}
++		${OPUS_INCLUDE_DIRS}
+ 		PARENT_SCOPE)
+ 	set(SOUND_LIBRARIES
+ 		${OPENAL_LIBRARY}
+ 		${VORBIS_LIBRARIES}
++		${OPUS_LIBRARIES}
+ 		PARENT_SCOPE)
+ endif()
+ 
+@@ -52,6 +54,7 @@ set(client_SRCS
+ 	${CMAKE_CURRENT_SOURCE_DIR}/filecache.cpp
+ 	${CMAKE_CURRENT_SOURCE_DIR}/fontengine.cpp
+ 	${CMAKE_CURRENT_SOURCE_DIR}/game.cpp
++	${CMAKE_CURRENT_SOURCE_DIR}/voicechat.cpp
+ 	${CMAKE_CURRENT_SOURCE_DIR}/gameui.cpp
+ 	${CMAKE_CURRENT_SOURCE_DIR}/game_formspec.cpp
+ 	${CMAKE_CURRENT_SOURCE_DIR}/guiscalingfilter.cpp
+diff --git a/src/client/client.cpp b/src/client/client.cpp
+index 2113435..ef5ccba 100644
+--- a/src/client/client.cpp
++++ b/src/client/client.cpp
+@@ -2101,6 +2101,11 @@ scene::IAnimatedMesh *Client::getMesh(const std::string &filename, bool *is_shar
+  * Mod channels
+  */
+ 
++void Client::setVoiceChatTokenHandler(std::function<void(const std::string &)> handler)
++{
++	m_voicechat_token_handler = handler;
++}
++
+ bool Client::joinModChannel(const std::string &channel)
+ {
+ 	if (m_modchannel_mgr->channelRegistered(channel))
+diff --git a/src/client/client.h b/src/client/client.h
+index a910fe5..1c4e36b 100644
+--- a/src/client/client.h
++++ b/src/client/client.h
+@@ -16,6 +16,7 @@
+ #include "util/numeric.h"
+ #include "util/string.h" // StringMap
+ 
++#include <functional>
+ #include <map>
+ #include <memory>
+ #include <ostream>
+@@ -444,6 +445,8 @@ class Client : public con::PeerHandler, public InventoryManager, public IGameDef
+ 			const std::string &message) override;
+ 	ModChannel *getModChannel(const std::string &channel) override;
+ 
++	void setVoiceChatTokenHandler(std::function<void(const std::string &)> handler);
++
+ 	const std::string &getFormspecPrepend() const;
+ 
+ 	inline MeshGrid getMeshGrid() const
+@@ -633,4 +636,5 @@ class Client : public con::PeerHandler, public InventoryManager, public IGameDef
+ 	u32 m_csm_restriction_noderange = 8;
+ 
+ 	std::unique_ptr<ModChannelMgr> m_modchannel_mgr;
++	std::function<void(const std::string &)> m_voicechat_token_handler;
+ };
+diff --git a/src/client/game.cpp b/src/client/game.cpp
+index f901556..91a5ec3 100644
+--- a/src/client/game.cpp
++++ b/src/client/game.cpp
+@@ -3,6 +3,7 @@
+ // Copyright (C) 2010-2013 celeron55, Perttu Ahola <celeron55@gmail.com>
+ 
+ #include "game_internal.h"
++#include "voicechat.h"
+ 
+ #include <cmath>
+ #include <csignal>
+@@ -397,6 +398,7 @@ Game::~Game()
+ 	delete client;
+ 	soundmaker.reset();
+ 	sound_manager.reset();
++	voicechat.reset();
+ 
+ 	delete server;
+ 
+@@ -462,6 +464,14 @@ bool Game::startup(volatile std::sig_atomic_t *kill,
+ 	if (!createClient(start_data))
+ 		return false;
+ 
++	initVoiceChat();
++
++	if (client && voicechat && g_settings->getBool("voicechat.enabled")) {
++		client->setVoiceChatTokenHandler([this](const std::string &token) {
++			voicechat->onControlMessage("token=" + token);
++		});
++	}
++
+ 	m_rendering_engine->initialize(client, hud);
+ 
+ 	m_game_formspec.init(client, m_rendering_engine, input);
+@@ -637,6 +647,11 @@ void Game::shutdown()
+ 	chat_backend->addMessage(L"", L"# Disconnected.");
+ 	chat_backend->addMessage(L"", L"");
+ 
++	if (voicechat) {
++		voicechat->stop();
++		voicechat.reset();
++	}
++
+ 	if (client) {
+ 		client->Stop();
+ 		while (!client->isShutdown()) {
+@@ -737,6 +752,20 @@ bool Game::initSound()
+ 	return true;
+ }
+ 
++void Game::initVoiceChat()
++{
++#if USE_SOUND
++	voicechat = std::make_unique<VoiceChat>();
++	if (!g_settings->getBool("voicechat.enabled")) {
++		infostream << "Voice chat disabled by setting." << std::endl;
++		return;
++	}
++	infostream << "Voice chat ready; use /voice on the server to join." << std::endl;
++#else
++	infostream << "Voice chat unavailable: this build has no sound support." << std::endl;
++#endif
++}
++
+ bool Game::createServer(GameStartData &start_data)
+ {
+ 	showOverlayMessage(N_("Creating server..."), 0, 5);
+@@ -1427,6 +1456,9 @@ void Game::processUserInput(f32 dtime)
+ 
+ void Game::processKeyInput()
+ {
++	if (voicechat)
++		voicechat->setPushToTalk(isKeyDown(KeyType::VOICE));
++
+ 	if (wasKeyDown(KeyType::DROP)) {
+ 		dropSelectedItem(isKeyDown(KeyType::SNEAK));
+ 	} else if (wasKeyDown(KeyType::AUTOFORWARD)) {
+@@ -2657,6 +2689,13 @@ void Game::updateSound(f32 dtime)
+ 
+ 	sound_volume_control(sound_manager.get(), device->isWindowActive());
+ 
++	if (voicechat) {
++		const v3f camera_pos = (1.0f/BS) * camera->getCameraNode()->getPosition()
++				+ intToFloat(camera_offset, 1.0f);
++		voicechat->update(dtime, camera_pos, camera->getDirection(),
++				camera->getCameraNode()->getUpVector());
++	}
++
+ 	// Update sound maker
+ 	ClientMap &map = client->getEnv().getClientMap();
+ 	MapNode n = map.getNode(player->getFootstepNodePos());
+diff --git a/src/client/game_internal.h b/src/client/game_internal.h
+index 6de7934..ec90370 100644
+--- a/src/client/game_internal.h
++++ b/src/client/game_internal.h
+@@ -102,7 +102,11 @@ using PausedNodesList = std::vector<PausedNode>;
+  * hides most of the stuff in this class (nothing in this class is required
+  * by any other file) but exposes the public methods/data only.
+  */
+-class Game {
++
++class VoiceChat;
++
++class Game
++{
+ public:
+ 	Game();
+ 	~Game();
+@@ -127,6 +131,7 @@ class Game {
+ 	// Basic initialisation
+ 	bool init(GameStartData &start_data);
+ 	bool initSound();
++	void initVoiceChat();
+ 	bool createServer(GameStartData &start_data);
+ 	void copyServerClientCache();
+ 
+@@ -318,6 +323,7 @@ class Game {
+ 
+ 	std::unique_ptr<ISoundManager> sound_manager;
+ 	std::unique_ptr<SoundMaker> soundmaker;
++	std::unique_ptr<VoiceChat> voicechat;
+ 
+ 	ChatBackend *chat_backend = nullptr;
+ 	CaptureLogOutput m_chat_log_buf;
+diff --git a/src/client/inputhandler.cpp b/src/client/inputhandler.cpp
+index 0f86e1e..19f3922 100644
+--- a/src/client/inputhandler.cpp
++++ b/src/client/inputhandler.cpp
+@@ -54,6 +54,7 @@ void MyEventReceiver::reloadKeybindings()
+ 	keybindings[KeyType::CMD_LOCAL] = getKeySetting("keymap_cmd_local");
+ 	keybindings[KeyType::CONSOLE] = getKeySetting("keymap_console");
+ 	keybindings[KeyType::MINIMAP] = getKeySetting("keymap_minimap");
++	keybindings[KeyType::VOICE] = getKeySetting("keymap_voice");
+ 	keybindings[KeyType::FREEMOVE] = getKeySetting("keymap_freemove");
+ 	keybindings[KeyType::PITCHMOVE] = getKeySetting("keymap_pitchmove");
+ 	keybindings[KeyType::FASTMOVE] = getKeySetting("keymap_fastmove");
+diff --git a/src/client/keys.h b/src/client/keys.h
+index edb9537..4f59ff9 100644
+--- a/src/client/keys.h
++++ b/src/client/keys.h
+@@ -66,6 +66,8 @@ class KeyType
+ 		QUICKTUNE_INC,
+ 		QUICKTUNE_DEC,
+ 
++		VOICE,
++
+ 		// hotbar
+ 		SLOT_1,
+ 		SLOT_2,
+diff --git a/src/client/voicechat.cpp b/src/client/voicechat.cpp
+new file mode 100644
+index 0000000..9e1b46a
+--- /dev/null
++++ b/src/client/voicechat.cpp
+@@ -0,0 +1,750 @@
++// Luanti
++// SPDX-License-Identifier: LGPL-2.1-or-later
++//
++// Native voice chat client implementation. See voicechat.h for the design.
++
++#include "voicechat.h"
++
++#include "log.h"
++#include "network/socket.h"
++#include "settings.h"
++
++#include <algorithm>
++#include <cctype>
++#include <chrono>
++#include <cmath>
++#include <cstring>
++#include <stdexcept>
++
++#if USE_SOUND
++
++namespace {
++
++constexpr uint8_t VOICE_MAGIC[4] = {'S', 'V', 'L', '1'};
++constexpr uint8_t PKT_HELLO = 1;
++constexpr uint8_t PKT_WELCOME = 2;
++constexpr uint8_t PKT_AUDIO = 3;
++constexpr uint8_t PKT_STATE = 4;
++constexpr uint8_t PKT_NOTICE = 5;
++constexpr uint8_t PKT_BYE = 6;
++constexpr uint8_t PKT_PING = 7;
++constexpr uint8_t PKT_ERROR = 8;
++
++constexpr uint8_t FLAG_SPEAKING = 8;
++constexpr int HEADER_SIZE = 8;
++constexpr int SAMPLE_RATE = 48000;
++constexpr int FRAME_SAMPLES = 960; // 20 ms at 48 kHz
++constexpr int MAX_PACKET = 1200;
++
++uint64_t nowMs()
++{
++	return std::chrono::duration_cast<std::chrono::milliseconds>(
++			std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++void putU16(std::vector<uint8_t> &out, uint16_t value)
++{
++	out.push_back(static_cast<uint8_t>(value & 0xff));
++	out.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
++}
++
++void putU32(std::vector<uint8_t> &out, uint32_t value)
++{
++	out.push_back(static_cast<uint8_t>(value & 0xff));
++	out.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
++	out.push_back(static_cast<uint8_t>((value >> 16) & 0xff));
++	out.push_back(static_cast<uint8_t>((value >> 24) & 0xff));
++}
++
++void putF32(std::vector<uint8_t> &out, float value)
++{
++	uint32_t bits;
++	memcpy(&bits, &value, sizeof(bits));
++	putU32(out, bits);
++}
++
++std::vector<uint8_t> makeHeader(uint8_t type, uint8_t flags = 0)
++{
++	return {VOICE_MAGIC[0], VOICE_MAGIC[1], VOICE_MAGIC[2], VOICE_MAGIC[3],
++			type, flags, 0, 0};
++}
++
++void putString(std::vector<uint8_t> &out, const std::string &value)
++{
++	const size_t length = std::min<size_t>(value.size(), 65535);
++	putU16(out, static_cast<uint16_t>(length));
++	out.insert(out.end(), value.begin(), value.begin() + length);
++}
++
++bool readU32(const uint8_t *data, size_t size, size_t &offset, uint32_t &value)
++{
++	if (offset + 4 > size)
++		return false;
++	value = static_cast<uint32_t>(data[offset]) |
++			(static_cast<uint32_t>(data[offset + 1]) << 8) |
++			(static_cast<uint32_t>(data[offset + 2]) << 16) |
++			(static_cast<uint32_t>(data[offset + 3]) << 24);
++	offset += 4;
++	return true;
++}
++
++bool readF32(const uint8_t *data, size_t size, size_t &offset, float &value)
++{
++	uint32_t bits;
++	if (!readU32(data, size, offset, bits))
++		return false;
++	memcpy(&value, &bits, sizeof(value));
++	return true;
++}
++
++bool readString(const uint8_t *data, size_t size, size_t &offset, std::string &value)
++{
++	if (offset + 2 > size)
++		return false;
++	const uint16_t length = static_cast<uint16_t>(data[offset]) |
++			(static_cast<uint16_t>(data[offset + 1]) << 8);
++	offset += 2;
++	if (offset + length > size)
++		return false;
++	value.assign(reinterpret_cast<const char *>(data + offset), length);
++	offset += length;
++	return true;
++}
++
++float settingFloat(const char *name, float fallback, float min, float max)
++{
++	if (!g_settings)
++		return fallback;
++	const std::string value = g_settings->get(name);
++	if (value.empty())
++		return fallback;
++	try {
++		return std::clamp(std::stof(value), min, max);
++	} catch (const std::exception &) {
++		return fallback;
++	}
++}
++
++std::string trim(const std::string &value)
++{
++	size_t begin = 0;
++	while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin])))
++		begin++;
++	size_t end = value.size();
++	while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1])))
++		end--;
++	return value.substr(begin, end - begin);
++}
++
++} // namespace
++
++VoiceChat::VoiceChat()
++{
++	if (!g_settings)
++		return;
++	m_push_to_talk_mode = g_settings->getBool("voicechat.push_to_talk");
++	m_threshold = settingFloat("voicechat.voice_activation_threshold", 0.02f, 0.0f, 1.0f);
++	m_input_gain = settingFloat("voicechat.input_gain", 1.0f, 0.1f, 4.0f);
++	m_output_volume = settingFloat("voicechat.output_volume", 1.0f, 0.0f, 1.0f);
++
++	// Keep the relay address available even when no token is configured yet:
++	// the /voice token arrives later over the chat control line.
++	const std::string host = g_settings->get("voicechat.relay_host");
++	if (!host.empty())
++		m_host = host;
++	try {
++		const unsigned long port = std::stoul(g_settings->get("voicechat.relay_port"));
++		if (port > 0 && port <= 65535)
++			m_port = static_cast<uint16_t>(port);
++	} catch (const std::exception &) {
++	}
++}
++
++VoiceChat::~VoiceChat()
++{
++	stop();
++}
++
++bool VoiceChat::start(const std::string &host, uint16_t port,
++		const std::string &token, std::string *error)
++{
++	if (m_thread.joinable())
++		stop();
++
++	if (host.empty() || port == 0 || token.empty()) {
++		if (error)
++			*error = "voice relay host, port and token are required";
++		return false;
++	}
++
++	Address address;
++	try {
++		address.Resolve(host.c_str());
++		address.setPort(port);
++	} catch (const std::exception &e) {
++		if (error)
++			*error = std::string("could not resolve voice relay: ") + e.what();
++		return false;
++	} catch (...) {
++		if (error)
++			*error = "could not resolve voice relay host";
++		return false;
++	}
++
++	// relay/src/voiceudp.js binds a udp4 socket. Reject IPv6 here instead of
++	// waiting forever for a WELCOME that cannot arrive.
++	if (address.isIPv6()) {
++		if (error)
++			*error = "voice relay must be reachable over IPv4";
++		return false;
++	}
++
++	m_socket = std::make_unique<UDPSocket>(UDPSocket::CreateEphemeral(false));
++	if (!m_socket) {
++		if (error)
++			*error = "could not create voice UDP socket";
++		return false;
++	}
++	m_socket->setTimeoutMs(5);
++
++	{
++		std::lock_guard<std::mutex> lock(m_mutex);
++		m_host = host;
++		m_port = port;
++		m_token = token;
++		m_relay_address = address;
++	}
++	{
++		std::lock_guard<std::mutex> lock(m_init_mutex);
++		m_init_done = false;
++		m_init_ok = false;
++		m_init_error.clear();
++	}
++	m_thread_stop = false;
++	m_connected = false;
++	m_transmitting = false;
++	m_sequence = 0;
++	m_last_state_ms = 0;
++	m_last_ping_ms = 0;
++	m_state_dirty = true;
++	setStatus("Voice: opening microphone...");
++
++	m_thread = std::thread(&VoiceChat::threadMain, this);
++
++	std::unique_lock<std::mutex> lock(m_init_mutex);
++	if (!m_init_cv.wait_for(lock, std::chrono::seconds(3),
++			[this] { return m_init_done; })) {
++		if (error)
++			*error = "timed out while opening the audio device";
++		lock.unlock();
++		stop();
++		return false;
++	}
++	if (!m_init_ok) {
++		if (error)
++			*error = m_init_error.empty() ? "could not open the audio device" : m_init_error;
++		lock.unlock();
++		stop();
++		return false;
++	}
++	return true;
++}
++
++void VoiceChat::stop()
++{
++	m_thread_stop = true;
++	if (m_thread.joinable())
++		m_thread.join();
++	m_socket.reset();
++	m_connected = false;
++	m_transmitting = false;
++	setStatus("Voice: disconnected");
++}
++
++bool VoiceChat::initAudio(std::string &error)
++{
++	m_playback_device = alcOpenDevice(nullptr);
++	if (!m_playback_device) {
++		error = "OpenAL could not open a playback device";
++		return false;
++	}
++	m_playback_context = alcCreateContext(m_playback_device, nullptr);
++	if (!m_playback_context || !alcMakeContextCurrent(m_playback_context)) {
++		error = "OpenAL could not create a playback context";
++		cleanupAudio();
++		return false;
++	}
++
++	m_capture_device = alcCaptureOpenDevice(nullptr, SAMPLE_RATE,
++			AL_FORMAT_MONO16, FRAME_SAMPLES);
++	if (!m_capture_device) {
++		error = "OpenAL could not open the microphone";
++		cleanupAudio();
++		return false;
++	}
++	alcCaptureStart(m_capture_device);
++
++	int opus_error = 0;
++	m_encoder = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP, &opus_error);
++	if (!m_encoder || opus_error != OPUS_OK) {
++		error = "Opus could not create the voice encoder";
++		cleanupAudio();
++		return false;
++	}
++	opus_encoder_ctl(m_encoder, OPUS_SET_BITRATE(32000));
++	opus_encoder_ctl(m_encoder, OPUS_SET_INBAND_FEC(1));
++	opus_encoder_ctl(m_encoder, OPUS_SET_PACKET_LOSS_PERC(10));
++	return true;
++}
++
++void VoiceChat::cleanupAudio()
++{
++	if (m_capture_device) {
++		alcCaptureStop(m_capture_device);
++		alcCaptureCloseDevice(m_capture_device);
++		m_capture_device = nullptr;
++	}
++	cleanupSpeakers();
++	if (m_encoder) {
++		opus_encoder_destroy(m_encoder);
++		m_encoder = nullptr;
++	}
++	if (m_playback_context) {
++		alcMakeContextCurrent(nullptr);
++		alcDestroyContext(m_playback_context);
++		m_playback_context = nullptr;
++	}
++	if (m_playback_device) {
++		alcCloseDevice(m_playback_device);
++		m_playback_device = nullptr;
++	}
++}
++
++void VoiceChat::threadMain()
++{
++	std::string error;
++	if (!initAudio(error)) {
++		{
++			std::lock_guard<std::mutex> lock(m_init_mutex);
++			m_init_error = error;
++			m_init_ok = false;
++			m_init_done = true;
++		}
++		m_init_cv.notify_all();
++		return;
++	}
++	{
++		std::lock_guard<std::mutex> lock(m_init_mutex);
++		m_init_ok = true;
++		m_init_done = true;
++	}
++	m_init_cv.notify_all();
++
++	sendHello();
++	setStatus("Voice: connecting to relay...");
++
++	while (!m_thread_stop) {
++		updateListener();
++
++		ALint available = 0;
++		alcGetIntegerv(m_capture_device, ALC_CAPTURE_SAMPLES, 1, &available);
++		if (available > 0) {
++			std::vector<int16_t> samples(available);
++			alcCaptureSamples(m_capture_device, samples.data(), available);
++			for (size_t i = 0; i + FRAME_SAMPLES <= samples.size(); i += FRAME_SAMPLES)
++				processFrame(&samples[i]);
++		}
++
++		receivePackets();
++		cleanupSpeakers();
++
++		const uint64_t now = nowMs();
++		if (m_state_dirty || now - m_last_state_ms >= 250)
++			sendState();
++		if (now - m_last_ping_ms >= 5000) {
++			sendPing();
++			m_last_ping_ms = now;
++		}
++
++		std::this_thread::sleep_for(std::chrono::milliseconds(10));
++	}
++
++	cleanupAudio();
++}
++
++void VoiceChat::processFrame(const int16_t *samples)
++{
++	int16_t pcm[FRAME_SAMPLES];
++	const float gain = m_input_gain.load();
++	double energy = 0.0;
++
++	for (int i = 0; i < FRAME_SAMPLES; i++) {
++		int value = static_cast<int>(samples[i] * gain);
++		value = std::clamp(value, -32768, 32767);
++		pcm[i] = static_cast<int16_t>(value);
++		energy += static_cast<double>(value) * value;
++	}
++
++	const float rms = std::sqrt(energy / FRAME_SAMPLES) / 32768.0f;
++	bool transmit = m_push_to_talk_mode.load() ? m_ptt.load() : (rms >= m_threshold.load());
++	if (!m_connected.load())
++		transmit = false;
++
++	if (transmit) {
++		unsigned char encoded[400];
++		const int length = opus_encode(m_encoder, pcm, FRAME_SAMPLES,
++				encoded, sizeof(encoded));
++		if (length > 0)
++			sendAudio(encoded, static_cast<size_t>(length));
++	}
++
++	if (transmit != m_transmitting.load()) {
++		m_transmitting = transmit;
++		m_state_dirty = true;
++	}
++}
++
++void VoiceChat::sendHello()
++{
++	if (!m_socket)
++		return;
++	std::vector<uint8_t> packet = makeHeader(PKT_HELLO);
++	std::string token;
++	{
++		std::lock_guard<std::mutex> lock(m_mutex);
++		token = m_token;
++	}
++	putString(packet, token);
++	m_socket->Send(m_relay_address, packet.data(), static_cast<int>(packet.size()));
++	m_last_ping_ms = nowMs();
++}
++
++void VoiceChat::sendAudio(const uint8_t *data, size_t size)
++{
++	if (!m_connected.load() || !m_socket)
++		return;
++	const uint32_t sequence = m_sequence.fetch_add(1);
++	const uint32_t timestamp = sequence * FRAME_SAMPLES;
++
++	std::vector<uint8_t> packet = makeHeader(PKT_AUDIO);
++	putU32(packet, sequence);
++	putU32(packet, timestamp);
++	packet.insert(packet.end(), data, data + size);
++	m_socket->Send(m_relay_address, packet.data(), static_cast<int>(packet.size()));
++}
++
++void VoiceChat::sendState()
++{
++	if (!m_connected.load() || !m_socket)
++		return;
++	const uint8_t flags = m_transmitting.load() ? FLAG_SPEAKING : 0;
++	const std::vector<uint8_t> packet = makeHeader(PKT_STATE, flags);
++	m_socket->Send(m_relay_address, packet.data(), static_cast<int>(packet.size()));
++	m_state_dirty = false;
++	m_last_state_ms = nowMs();
++}
++
++void VoiceChat::sendPing()
++{
++	if (!m_connected.load() || !m_socket)
++		return;
++	const std::vector<uint8_t> packet = makeHeader(PKT_PING);
++	m_socket->Send(m_relay_address, packet.data(), static_cast<int>(packet.size()));
++}
++
++void VoiceChat::receivePackets()
++{
++	if (!m_socket)
++		return;
++	uint8_t buffer[MAX_PACKET];
++	Address sender;
++	for (;;) {
++		const int length = m_socket->Receive(sender, buffer,
++				static_cast<int>(sizeof(buffer)));
++		if (length <= 0)
++			break;
++		if (sender != m_relay_address)
++			continue;
++		handlePacket(buffer, static_cast<size_t>(length));
++	}
++}
++
++void VoiceChat::handlePacket(const uint8_t *data, size_t size)
++{
++	if (size < HEADER_SIZE || memcmp(data, VOICE_MAGIC, sizeof(VOICE_MAGIC)) != 0)
++		return;
++
++	const uint8_t type = data[4];
++	size_t offset = HEADER_SIZE;
++
++	if (type == PKT_WELCOME) {
++		uint32_t session_id = 0;
++		std::string name;
++		if (!readU32(data, size, offset, session_id) ||
++				!readString(data, size, offset, name))
++			return;
++		m_session_id = session_id;
++		m_connected = true;
++		m_state_dirty = true;
++		setStatus("Voice: connected as " + name);
++		return;
++	}
++
++	if (type == PKT_AUDIO) {
++		uint32_t sender_id = 0, sequence = 0, timestamp = 0;
++		float x = 0, y = 0, z = 0;
++		std::string name;
++		if (!readU32(data, size, offset, sender_id) ||
++				!readU32(data, size, offset, sequence) ||
++				!readU32(data, size, offset, timestamp) ||
++				!readF32(data, size, offset, x) ||
++				!readF32(data, size, offset, y) ||
++				!readF32(data, size, offset, z) ||
++				!readString(data, size, offset, name))
++			return;
++		if (offset >= size)
++			return;
++		const float pos[3] = {x, y, z};
++		playAudio(sender_id, sequence, pos, name, data + offset, size - offset);
++		return;
++	}
++
++	if (type == PKT_NOTICE || type == PKT_ERROR || type == PKT_BYE) {
++		std::string text;
++		if (!readString(data, size, offset, text))
++			return;
++		if (type == PKT_ERROR) {
++			m_connected = false;
++			setStatus("Voice error: " + text);
++		} else if (type == PKT_BYE) {
++			m_connected = false;
++			setStatus("Voice: disconnected (" + text + ")");
++		} else {
++			setStatus("Voice: " + text);
++		}
++	}
++}
++
++void VoiceChat::playAudio(uint32_t sender_id, uint32_t sequence,
++		const float pos[3], const std::string &name,
++		const uint8_t *data, size_t size)
++{
++	if (!m_playback_context || size == 0 || size > 1000)
++		return;
++
++	Speaker &speaker = m_speakers[sender_id];
++	if (!speaker.decoder) {
++		int error = 0;
++		speaker.decoder = opus_decoder_create(SAMPLE_RATE, 1, &error);
++		if (!speaker.decoder || error != OPUS_OK) {
++			if (speaker.decoder)
++				opus_decoder_destroy(speaker.decoder);
++			speaker.decoder = nullptr;
++			m_speakers.erase(sender_id);
++			return;
++		}
++	}
++	if (!speaker.source) {
++		alGenSources(1, &speaker.source);
++		if (speaker.source == 0) {
++			opus_decoder_destroy(speaker.decoder);
++			speaker.decoder = nullptr;
++			m_speakers.erase(sender_id);
++			return;
++		}
++		alSourcef(speaker.source, AL_ROLLOFF_FACTOR, 1.0f);
++		alSourcef(speaker.source, AL_REFERENCE_DISTANCE, 1.0f);
++		alSourcef(speaker.source, AL_MAX_DISTANCE, 64.0f);
++		alSourcef(speaker.source, AL_GAIN, m_output_volume.load());
++	}
++
++	alSource3f(speaker.source, AL_POSITION, pos[0], pos[1], pos[2]);
++	alSourcef(speaker.source, AL_GAIN, m_output_volume.load());
++
++	int16_t pcm[FRAME_SAMPLES * 6];
++	const int decoded = opus_decode(speaker.decoder, data, static_cast<opus_int32>(size),
++			pcm, FRAME_SAMPLES * 6, 0);
++	if (decoded <= 0)
++		return;
++
++	ALint processed = 0;
++	alGetSourcei(speaker.source, AL_BUFFERS_PROCESSED, &processed);
++	while (processed-- > 0) {
++		ALuint buffer = 0;
++		alSourceUnqueueBuffers(speaker.source, 1, &buffer);
++		if (buffer)
++			alDeleteBuffers(1, &buffer);
++	}
++
++	ALint queued = 0;
++	alGetSourcei(speaker.source, AL_BUFFERS_QUEUED, &queued);
++	if (queued >= 8)
++		return;
++
++	ALuint buffer = 0;
++	alGenBuffers(1, &buffer);
++	if (!buffer)
++		return;
++	alBufferData(buffer, AL_FORMAT_MONO16, pcm, decoded * sizeof(int16_t), SAMPLE_RATE);
++	alSourceQueueBuffers(speaker.source, 1, &buffer);
++
++	ALint state = 0;
++	alGetSourcei(speaker.source, AL_SOURCE_STATE, &state);
++	if (state != AL_PLAYING)
++		alSourcePlay(speaker.source);
++
++	speaker.last_sequence = sequence;
++	speaker.last_packet_ms = nowMs();
++	speaker.name = name;
++}
++
++void VoiceChat::updateListener()
++{
++	if (!m_playback_context)
++		return;
++
++	v3f position, direction, up;
++	{
++		std::lock_guard<std::mutex> lock(m_mutex);
++		position = m_listener_pos;
++		direction = m_listener_dir;
++		up = m_listener_up;
++	}
++
++	alListener3f(AL_POSITION, position.X, position.Y, position.Z);
++	const ALfloat orientation[6] = {
++			direction.X, direction.Y, direction.Z,
++			up.X, up.Y, up.Z};
++	alListenerfv(AL_ORIENTATION, orientation);
++}
++
++void VoiceChat::cleanupSpeakers()
++{
++	const uint64_t now = nowMs();
++	for (auto it = m_speakers.begin(); it != m_speakers.end();) {
++		if (now - it->second.last_packet_ms < 2000) {
++			++it;
++			continue;
++		}
++		if (it->second.source)
++			alDeleteSources(1, &it->second.source);
++		if (it->second.decoder)
++			opus_decoder_destroy(it->second.decoder);
++		it = m_speakers.erase(it);
++	}
++}
++
++void VoiceChat::update(f32 dtime, const v3f &listener_pos,
++		const v3f &listener_dir, const v3f &listener_up)
++{
++	(void)dtime;
++	std::lock_guard<std::mutex> lock(m_mutex);
++	m_listener_pos = listener_pos;
++	m_listener_dir = listener_dir;
++	m_listener_up = listener_up;
++}
++
++void VoiceChat::setPushToTalk(bool pressed)
++{
++	m_ptt = pressed;
++}
++
++void VoiceChat::onControlMessage(const std::string &message)
++{
++	std::string token, host;
++	uint16_t port = 0;
++	if (!parseControl(message, token, host, port))
++		return;
++
++	if (isConnected()) {
++		std::lock_guard<std::mutex> lock(m_mutex);
++		if (token == m_token)
++			return;
++	}
++
++	stop();
++	std::string error;
++	if (!start(host, port, token, &error))
++		setStatus("Voice: " + error);
++}
++
++bool VoiceChat::parseControl(const std::string &message, std::string &token,
++		std::string &host, uint16_t &port)
++{
++	{
++		std::lock_guard<std::mutex> lock(m_mutex);
++		host = m_host;
++		port = m_port;
++	}
++
++	size_t start = 0;
++	while (start <= message.size()) {
++		const size_t end = message.find(';', start);
++		const std::string part = message.substr(start,
++				end == std::string::npos ? std::string::npos : end - start);
++		const size_t equals = part.find('=');
++		if (equals != std::string::npos) {
++			const std::string key = trim(part.substr(0, equals));
++			const std::string value = trim(part.substr(equals + 1));
++			if (key == "token")
++				token = value;
++			else if (key == "host")
++				host = value;
++			else if (key == "port") {
++				try {
++					const unsigned long parsed = std::stoul(value);
++					if (parsed > 0 && parsed <= 65535)
++						port = static_cast<uint16_t>(parsed);
++				} catch (const std::exception &) {
++					return false;
++				}
++			}
++		}
++		if (end == std::string::npos)
++			break;
++		start = end + 1;
++	}
++
++	if (token.empty() || host.empty() || port == 0) {
++		setStatus("Voice: invalid control message");
++		return false;
++	}
++	return true;
++}
++
++void VoiceChat::setStatus(const std::string &status)
++{
++	std::lock_guard<std::mutex> lock(m_mutex);
++	m_status = status;
++}
++
++std::string VoiceChat::statusText() const
++{
++	std::lock_guard<std::mutex> lock(m_mutex);
++	return m_status;
++}
++
++#else // USE_SOUND
++
++VoiceChat::VoiceChat() = default;
++VoiceChat::~VoiceChat() = default;
++
++bool VoiceChat::start(const std::string &, uint16_t, const std::string &,
++		std::string *error)
++{
++	if (error)
++		*error = "this Luanti build has no sound support";
++	return false;
++}
++
++void VoiceChat::stop() {}
++void VoiceChat::update(f32, const v3f &, const v3f &, const v3f &) {}
++void VoiceChat::setPushToTalk(bool) {}
++void VoiceChat::onControlMessage(const std::string &) {}
++
++std::string VoiceChat::statusText() const
++{
++	return "Voice unavailable (no sound support)";
++}
++
++#endif // USE_SOUND
+diff --git a/src/client/voicechat.h b/src/client/voicechat.h
+new file mode 100644
+index 0000000..0f810d0
+--- /dev/null
++++ b/src/client/voicechat.h
+@@ -0,0 +1,124 @@
++// Luanti
++// SPDX-License-Identifier: LGPL-2.1-or-later
++//
++// Native voice chat for the Simple Voice Chat client fork.
++//
++// This module owns its own OpenAL playback context and capture device, encodes
++// microphone audio with Opus, sends it over UDP to the voice relay, and renders
++// the relay's forwarded audio as 3D sources. The main Luanti sound manager is
++// deliberately not involved: voice needs a continuous stream, not sound files.
++
++#pragma once
++
++#include "config.h"
++#include "irr_v3d.h"
++#include "network/address.h"
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++#if USE_SOUND
++#include <AL/al.h>
++#include <AL/alc.h>
++#include <opus.h>
++#endif
++
++class UDPSocket;
++
++class VoiceChat
++{
++public:
++	VoiceChat();
++	~VoiceChat();
++
++	/// Opens the audio devices and starts the network thread. The connection
++	/// itself is asynchronous; isConnected() becomes true on WELCOME.
++	bool start(const std::string &host, uint16_t port, const std::string &token,
++			std::string *error = nullptr);
++	void stop();
++
++	/// Called from the game loop. The listener is the camera, in node space.
++	void update(f32 dtime, const v3f &listener_pos, const v3f &listener_dir,
++			const v3f &listener_up);
++	void setPushToTalk(bool pressed);
++
++	/// Native control message from the server mod (currently a join token).
++	void onControlMessage(const std::string &message);
++
++	bool isConnected() const { return m_connected.load(); }
++	bool isTransmitting() const { return m_transmitting.load(); }
++	std::string statusText() const;
++
++private:
++	void threadMain();
++	bool initAudio(std::string &error);
++	void cleanupAudio();
++	void processFrame(const int16_t *samples);
++	void sendHello();
++	void sendAudio(const uint8_t *data, size_t size);
++	void sendState();
++	void sendPing();
++	void receivePackets();
++	void handlePacket(const uint8_t *data, size_t size);
++	void playAudio(uint32_t sender_id, uint32_t sequence, const float pos[3],
++			const std::string &name, const uint8_t *data, size_t size);
++	void updateListener();
++	void cleanupSpeakers();
++	void setStatus(const std::string &status);
++	bool parseControl(const std::string &message, std::string &token,
++			std::string &host, uint16_t &port);
++
++	std::atomic<bool> m_thread_stop{false};
++	std::atomic<bool> m_connected{false};
++	std::atomic<bool> m_transmitting{false};
++	std::atomic<bool> m_ptt{false};
++	std::atomic<bool> m_push_to_talk_mode{true};
++	std::atomic<float> m_threshold{0.02f};
++	std::atomic<float> m_input_gain{1.0f};
++	std::atomic<float> m_output_volume{1.0f};
++	std::atomic<bool> m_state_dirty{true};
++	std::atomic<uint32_t> m_session_id{0};
++	std::atomic<uint32_t> m_sequence{0};
++	std::atomic<uint64_t> m_last_state_ms{0};
++	std::atomic<uint64_t> m_last_ping_ms{0};
++
++	mutable std::mutex m_mutex;
++	v3f m_listener_pos{0, 0, 0};
++	v3f m_listener_dir{0, 0, 1};
++	v3f m_listener_up{0, 1, 0};
++	std::string m_status;
++	std::string m_host;
++	uint16_t m_port = 0;
++	std::string m_token;
++	Address m_relay_address;
++	std::unique_ptr<UDPSocket> m_socket;
++
++	std::mutex m_init_mutex;
++	std::condition_variable m_init_cv;
++	bool m_init_done = false;
++	bool m_init_ok = false;
++	std::string m_init_error;
++
++#if USE_SOUND
++	ALCdevice *m_capture_device = nullptr;
++	ALCdevice *m_playback_device = nullptr;
++	ALCcontext *m_playback_context = nullptr;
++	OpusEncoder *m_encoder = nullptr;
++
++	struct Speaker {
++		ALuint source = 0;
++		OpusDecoder *decoder = nullptr;
++		uint32_t last_sequence = 0;
++		uint64_t last_packet_ms = 0;
++		std::string name;
++	};
++	std::unordered_map<uint32_t, Speaker> m_speakers;
++#endif
++};
+diff --git a/src/defaultsettings.cpp b/src/defaultsettings.cpp
+index d0e0562..864043e 100644
+--- a/src/defaultsettings.cpp
++++ b/src/defaultsettings.cpp
+@@ -100,6 +100,13 @@ void set_default_settings()
+ 	settings->setDefault("touch_gui", bool_to_cstr(has_touch));
+ 	settings->setDefault("sound_volume", "0.8");
+ 	settings->setDefault("sound_volume_unfocused", "0.3");
++	settings->setDefault("voicechat.enabled", "true");
++	settings->setDefault("voicechat.relay_host", "127.0.0.1");
++	settings->setDefault("voicechat.relay_port", "8091");
++	settings->setDefault("voicechat.push_to_talk", "true");
++	settings->setDefault("voicechat.voice_activation_threshold", "0.02");
++	settings->setDefault("voicechat.input_gain", "1.0");
++	settings->setDefault("voicechat.output_volume", "1.0");
+ 	settings->setDefault("mute_sound", "false");
+ 	settings->setDefault("sound_extensions_blacklist", "");
+ 	settings->setDefault("mesh_generation_interval", "0");
+@@ -149,6 +156,7 @@ void set_default_settings()
+ 	settings->setDefault("keymap_cmd", "SYSTEM_SCANCODE_56"); // /
+ 	settings->setDefault("keymap_cmd_local", "SYSTEM_SCANCODE_55"); // .
+ 	settings->setDefault("keymap_minimap", "SYSTEM_SCANCODE_25|GAMEPAD_BUTTON_4"); // KEY_KEY_V|Gamepad Back
++	settings->setDefault("keymap_voice", "SYSTEM_SCANCODE_9"); // KEY_KEY_F
+ 	settings->setDefault("keymap_console", "SYSTEM_SCANCODE_67"); // KEY_F10
+ 
+ 	// see <https://github.com/luanti-org/luanti/issues/12792>
+diff --git a/src/network/clientpackethandler.cpp b/src/network/clientpackethandler.cpp
+index 7ebc27c..ff98e73 100644
+--- a/src/network/clientpackethandler.cpp
++++ b/src/network/clientpackethandler.cpp
+@@ -404,6 +404,17 @@ void Client::handleCommand_ChatMessage(NetworkPacket *pkt)
+ 	*pkt >> chatMessage->sender >> chatMessage->message >> timestamp;
+ 	chatMessage->timestamp = static_cast<std::time_t>(timestamp);
+ 
++	// Private control line for the native voice client. It is addressed to one
++	// player by the mod, so it never leaks the join token to other players.
++	static const std::wstring voice_token_prefix = L"SVC-TOKEN:";
++	if (m_voicechat_token_handler && chatMessage->message.compare(0,
++			voice_token_prefix.size(), voice_token_prefix) == 0) {
++		m_voicechat_token_handler(wide_to_utf8(
++				chatMessage->message.substr(voice_token_prefix.size())));
++		delete chatMessage;
++		return;
++	}
++
+ 	chatMessage->type = (ChatMessageType) message_type;
+ 
+ 	// log the chat message
+diff --git a/vcpkg.json b/vcpkg.json
+index f394538..61eca77 100644
+--- a/vcpkg.json
++++ b/vcpkg.json
+@@ -15,6 +15,7 @@
+       ]
+     },
+     "openal-soft",
++    "opus",
+     "libvorbis",
+     "libogg",
+     "libjpeg-turbo",

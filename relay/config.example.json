@@ -1,0 +1,24 @@
+{
+  "host": "0.0.0.0",
+  "port": 8090,
+  "voice_udp_host": "0.0.0.0",
+  "voice_udp_port": 8091,
+
+  "secret": "change-me-to-a-long-random-string",
+
+  "max_voice_distance": 32,
+  "whisper_distance": 8,
+  "broadcast_range": 0,
+  "allow_recording": true,
+  "groups_enabled": true,
+  "max_group_members": 20,
+
+  "sync_timeout": 15,
+  "token_ttl": 120,
+  "require_known_player": true,
+
+  "ice_servers": [],
+  "invert_pan": false,
+
+  "tls": null
+}

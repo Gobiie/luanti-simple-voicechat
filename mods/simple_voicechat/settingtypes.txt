@@ -1,0 +1,25 @@
+#    Base URL of the simple_voicechat relay, for example https://voice.example.com
+#    The mod must be listed in secure.http_mods for this setting to work.
+simple_voicechat.relay_url (Voice relay URL) string
+
+#    Shared secret, must match "secret" in the relay config file.
+#    Keep minetest.conf readable only by the server user.
+simple_voicechat.secret (Voice relay secret) string
+
+#    Seconds between player position updates sent to the relay.
+#    type: float min: 0.1 max: 2.0
+simple_voicechat.sync_interval (Voice sync interval) float 0.25
+
+#    Show a HUD indicator while a player is connected to voice chat.
+simple_voicechat.hud (Voice HUD indicator) bool true
+
+#    Tell players about /voice when they join the game.
+simple_voicechat.join_hint (Voice join hint) bool true
+
+#    Tint a player's own nametag while their microphone is transmitting.
+#    Other mods that recolour nametags may conflict with this.
+simple_voicechat.nametag_indicators (Voice speaking nametag tint) bool true
+
+#    Recommend voice chat to every player who has not joined it yet.
+#    Luanti cannot force a browser session, so this is a visible reminder.
+simple_voicechat.force_voice_chat (Require voice chat) bool false
