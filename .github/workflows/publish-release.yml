@@ -1,0 +1,85 @@
+name: publish-release
+
+on:
+  workflow_run:
+    workflows: ["build"]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    name: Attach build artifacts to v0.1.0
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_sha == 'b5ffdf06ca9e47b6dbbd207ace9e4d7a68da41f3'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download verified artifacts
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: artifacts
+          merge-multiple: true
+
+      - name: Inspect artifacts
+        run: ls -lh artifacts
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.0
+          target_commitish: ${{ github.event.workflow_run.head_sha }}
+          name: Simple Voice Chat for Luanti v0.1.0
+          body: |
+            # Simple Voice Chat for Luanti v0.1.0
+
+            Native in-game voice client, Lua server mod, UDP/WebRTC relay and browser panel.
+
+            ## Downloads
+
+            - `luanti-simple-voicechat-linux-x86_64.tar.gz` — Linux x86_64 client and engine
+            - `luanti-simple-voicechat-windows-x64.zip` — Windows x64 client and engine
+
+            Extract the archive and run `bin/luanti` (Linux) or `luanti.exe` (Windows).
+            The Windows package contains its vcpkg DLLs. On Linux install the runtime
+            libraries listed in `client/README.md` (OpenAL and Opus are required).
+
+            ## Build verification
+
+            GitHub Actions built both clients from Luanti
+            `18cbd54dbbc0449b8329dd6fe32bdb387e63bb79` with
+            `client/patches/0001-native-voicechat.patch`. Each job installs or packages
+            the result and runs `luanti --version`. The relay suite runs 46/46 tests.
+
+            These are CI smoke tests only. In-game microphone capture, OpenAL playback,
+            the UDP relay on real hardware and two-player audio were **not** tested.
+            The browser panel was exercised in Chromium; WebRTC audio itself could not
+            be heard in the cloud test environment.
+
+            ## Setup
+
+            1. Start the relay from `relay/` (`npm install`, configure `secret`, `npm start`).
+            2. Copy `mods/simple_voicechat` into the Luanti mods directory and enable it.
+            3. Set `secure.http_mods`, `simple_voicechat.relay_url` and
+               `simple_voicechat.secret` in `minetest.conf`.
+            4. For the native client set `voicechat.relay_host` and `voicechat.relay_port`,
+               then hold `F` to talk. The browser panel remains the fallback with the
+               full group, whisper, broadcast, recording and device UI.
+
+            See `README.md`, `client/README.md` and `docs/PROTOCOL.md` for details.
+
+            ## Known limits
+
+            - The native client is a first client patch: no native group menu, whisper,
+              broadcast, device picker, automatic gain, noise suppression or recording.
+            - The native client sends only the speaking flag; self-mute, whisper and
+              broadcast exist in the wire protocol but are not bound to keys.
+            - The UDP transport is IPv4.
+            - Luanti cannot force a browser voice session; the mod can only nag.
+          files: artifacts/*
+          fail_on_unmatched_files: true
