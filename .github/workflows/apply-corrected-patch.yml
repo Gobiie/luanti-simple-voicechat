@@ -1,7 +1,8 @@
 name: apply-corrected-patch
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [fix/patch-thread]
 
 permissions:
   contents: write
